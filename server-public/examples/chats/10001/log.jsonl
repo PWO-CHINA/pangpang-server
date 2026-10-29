@@ -1,0 +1,4 @@
+{"date": "2026-01-01T10:00:00Z", "chatId": "10001", "role": "user", "name": "Test User", "text": "Please remember that my sample project is called Sample Garden."}
+{"date": "2026-01-01T10:00:02Z", "chatId": "10001", "role": "assistant", "name": "Test Agent", "text": "I will remember the fictional project name: Sample Garden."}
+{"date": "2026-01-01T10:05:00Z", "chatId": "10001", "role": "user", "name": "Test User", "text": "What is the name of my sample project?"}
+{"date": "2026-01-01T10:05:02Z", "chatId": "10001", "role": "assistant", "name": "Test Agent", "text": "Your sample project is called Sample Garden."}

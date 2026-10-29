@@ -1,0 +1,21 @@
+# caveman proxy configuration (CAVEMAN_CONFIG).  The proxy is run by `pp up`
+# and compresses what pangpang sends to its model providers: tool output,
+# logs, JSON, search results.  Originals stay in var/caveman and the model can
+# recover them with caveman_retrieve.  Keys come from .env, never from here.
+#
+# Each compat mount must be named after the pi provider and match the base
+# URL pi uses exactly, or that provider stays direct (see src/caveman/routes.ts).
+label: pangpang
+mode: compress
+listen: 127.0.0.1:8787
+upstream_proxy: env
+compat:
+  xiaomi:
+    # pi's built-in xiaomi provider (pay-as-you-go) calls this exact URL.
+    base_url: https://api.xiaomimimo.com/v1
+    api_key_env: XIAOMI_API_KEY
+  deepseek:
+    # agent/models.json points pi's deepseek provider at /v1 too, so pi's
+    # request URL and the proxy's forward URL match (caveman's route proof).
+    base_url: https://api.deepseek.com/v1
+    api_key_env: DEEPSEEK_API_KEY

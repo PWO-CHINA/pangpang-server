@@ -1,0 +1,7 @@
+{
+  "defaultProvider": "alias",
+  "defaultModel": "main",
+  "defaultThinkingLevel": "medium",
+  "enableInstallTelemetry": false,
+  "collapseChangelog": true
+}

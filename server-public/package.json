@@ -1,0 +1,24 @@
+{
+  "name": "pangpang",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Personal pi-based agent loop, run as a long-lived daemon on a server.",
+  "dependencies": {
+    "@agentclientprotocol/sdk": "1.5.0",
+    "@earendil-works/pi-ai": "0.87.1",
+    "@earendil-works/pi-coding-agent": "0.87.1",
+    "@earendil-works/pi-tui": "0.87.1",
+    "@huggingface/transformers": "^3.8.1",
+    "croner": "^9.1.0",
+    "typebox": "1.3.27"
+  },
+  "scripts": {
+    "daemon": "node src/daemon.ts",
+    "check": "tsc --noEmit -p ."
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.0"
+  }
+}

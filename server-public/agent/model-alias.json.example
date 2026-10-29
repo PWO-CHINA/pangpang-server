@@ -1,0 +1,20 @@
+{
+  "$defaults": {
+    "timeouts": {
+      "firstEventMs": 60000,
+      "stallMs": 120000
+    },
+    "cooldown": {
+      "baseMs": 300000,
+      "capMs": 3600000,
+      "resetSuccesses": 1
+    }
+  },
+  "main": [
+    "deepseek/deepseek-flash",
+    "deepseek/deepseek-v4-pro",
+    "xiaomi/mimo-v2.6-pro",
+    "xiaomi/mimo-v2.6-flash",
+    "xiaomi/mimo-v2.5-pro"
+  ]
+}

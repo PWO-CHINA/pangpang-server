@@ -1,0 +1,8 @@
+{
+  "enabled": false,
+  "schedule": "0 9 * * 1",
+  "timezone": "UTC",
+  "do": {
+    "notify": "Synthetic reminder for Sample Garden."
+  }
+}

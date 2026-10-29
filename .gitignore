@@ -1,0 +1,5 @@
+# Everything is private until explicitly reviewed and allowed.
+/*
+!/.gitignore
+!/README.md
+!/server-public/

@@ -1,0 +1,49 @@
+pangpang adapts code and prompt text from the following MIT-licensed projects.
+
+pi-mom (src/conversation.ts layout, src/events.ts)
+  https://github.com/badlogic/pi-mono (packages/mom, removed in 0ed0d434)
+  Copyright (c) 2025 Mario Zechner
+
+Hermes Agent (src/memory.ts, src/search.ts, src/skills.ts, src/review.ts,
+src/prompts.ts compaction handoff and review prompts)
+  https://github.com/NousResearch/hermes-agent
+  Copyright (c) 2025 Nous Research
+
+pi-model-fallback-alias 0.2.0 (src/pool/, full license in src/pool/LICENSE)
+  https://github.com/unrelentingfox/pi-model-fallback-alias
+  Copyright (c) 2026 Dustin Fox
+
+Caveman pi extension (src/caveman/: from packages/pi-extension and
+packages/cli/src/provider-routing.ts), and the caveman-proxy / caveman-mcp
+binaries built from source by bootstrap.sh (engine and proxy are BSL-1.1,
+used here first-party and self-hosted, not distributed)
+  https://github.com/JuliusBrussee/caveman at 2fd153c
+  Copyright (c) Julius Brussee
+
+ssh-remote-connection skill (ideas and script interface in agent/skills/remote-dev)
+  https://github.com/artwist-polyakov/polyakov-claude-skills
+  Copyright (c) artwist-polyakov
+
+Caveman skills (agent/skills/: caveman*, cavecrew, investigate-first,
+lean-build, migration, safe-refactor, surgical-patch, verify-and-stop,
+generated/, native/)
+  https://github.com/JuliusBrussee/caveman (skills/ at 2fd153c)
+  Copyright (c) Julius Brussee
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

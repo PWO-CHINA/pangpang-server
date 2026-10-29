@@ -1,0 +1,18 @@
+# Native toolchain for pangpang, installed by ./bootstrap.sh into
+# .tools/mamba/envs/pangpang.  Everything the agent spawns comes from here,
+# never from the system /usr or /opt.
+name: pangpang
+channels:
+  - conda-forge
+dependencies:
+  - nodejs=22
+  - direnv
+  - tmux
+  - git
+  - ripgrep
+  - fd-find
+  - jq
+  - curl
+  - python=3.12
+  - uv
+  - go >=1.26.5

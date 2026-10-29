@@ -1,0 +1,3 @@
+{
+  "providers": { "deepseek": { "baseUrl": "https://api.deepseek.com/v1" } }
+}

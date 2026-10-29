@@ -1,0 +1,293 @@
+#!/usr/bin/env bash
+# pp: pangpang operator CLI.
+#
+# Services: caveman-proxy (token compression) and pangpangd.
+# Idempotent, safe to run repeatedly or concurrently:
+#   pp up             start both under their supervisors if not running
+#   pp down           stop them gracefully
+#   pp restart
+#   pp request-restart  restart once every chat is idle (for self-upgrades)
+#   pp pause          skip cron tasks and background review
+#   pp resume
+#   pp status         daemon, pause state, tasks, hooks, chats
+#   pp logs [caveman] follow var/logs/pangpangd.log (or caveman.log)
+#
+# Work:
+#   pp add TEXT...    wake the agent now with TEXT in the owner's chat
+#   pp tasks          list tasks and hooks, and recent automation runs
+#   pp chat [ARGS]    interactive pi in this terminal (separate from the daemon)
+#   pp run PROMPT     one-shot pi run in the foreground
+#   pp recall TEXT    show what automatic recall would add for TEXT
+#   pp embed [-v]     embed new recall chunks (low priority, own process; weekly task)
+#
+# Maintenance:
+#   pp doctor         check toolchain, paths, disk, secrets, daemon
+#   pp check          typecheck src/
+#   pp update         re-run ./bootstrap.sh
+set -euo pipefail
+
+PP_HOME=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd -P)
+
+# caveman's SQLite stores refuse a group- or world-writable parent, and
+# Ubuntu gives ordinary users umask 002.  Everything pp starts inherits this.
+umask 022
+
+# Re-exec inside the project environment when called from a bare shell,
+# a DSM scheduled task (no HOME, minimal PATH), or ssh.
+if [ "${PP_ENV_LOADED:-}" != 1 ]; then
+  export HOME=${HOME:-/root}
+  export DIRENV_LOG_FORMAT=
+  exec "$PP_HOME/.tools/mamba/envs/pangpang/bin/direnv" exec "$PP_HOME" \
+    "$PP_HOME/bin/pp" "$@"
+fi
+
+RUN=$PP_VAR/run
+TASKS=$PP_HOME/data/tasks
+mkdir -p "$RUN" "$PP_VAR/logs" "$TASKS"
+
+# Two supervised services, each with its own lock, pid file and log:
+#   caveman  the token-compression proxy (started first, stopped last)
+#   daemon   pangpangd
+SERVICES_UP="caveman daemon"
+SERVICES_DOWN="daemon caveman"
+
+svc_log() { case $1 in daemon) echo "$PP_VAR/logs/pangpangd.log" ;; *) echo "$PP_VAR/logs/$1.log" ;; esac; }
+svc_name() { case $1 in daemon) echo pangpangd ;; caveman) echo caveman-proxy ;; esac; }
+
+# The supervisor holds var/run/<service>.lock for its whole life, so the
+# lock is the source of truth; the pid file only says which process to signal.
+svc_pid() {
+  flock -n "$RUN/$1.lock" true 2>/dev/null && return 1
+  cat "$RUN/$1.pid" 2>/dev/null
+}
+daemon_pid() { svc_pid daemon; }
+
+# Serialize up/down so a boot task, a periodic `pp up` and a human never
+# race each other.
+with_lock() { exec 8>"$RUN/pp.lock"; flock -w 60 8; }
+
+say() { printf '%s pp: %s\n' "$(date '+%F %T')" "$*"; }
+
+# One service's command.  Reloads .envrc and .env on every start so edited
+# secrets take effect on restart, whatever environment the supervisor had.
+# `exec` matters: run as `svc_run x &`, the function is a subshell, and
+# without exec the supervisor's TERM would reach that subshell and orphan
+# the real service (still holding its lock).
+svc_run() {
+  case $1 in
+    daemon) exec direnv exec "$PP_HOME" node --disable-warning=ExperimentalWarning "$PP_HOME/src/daemon.ts" ;;
+    caveman) exec direnv exec "$PP_HOME" "$CAVEMAN_HOME/bin/caveman-proxy" serve ;;
+  esac
+}
+
+# Supervisor: runs one service and restarts it with backoff if it crashes.
+cmd__supervise() {
+  local svc=${1:?service}
+  exec 9>"$RUN/$svc.lock"
+  flock -n 9 || exit 0
+  echo $$ > "$RUN/$svc.pid"
+  local stopping='' child='' rc started backoff=5 name
+  name=$(svc_name "$svc")
+  trap 'stopping=1; [ -n "$child" ] && kill -TERM "$child" 2>/dev/null' TERM INT HUP
+  say "$svc supervisor started (pid $$)"
+  while [ -z "$stopping" ]; do
+    started=$(date +%s)
+    # The child inherits the lock too: if the supervisor is killed, a
+    # surviving service still blocks a second start.
+    svc_run "$svc" &
+    child=$!
+    rc=0; wait "$child" || rc=$?
+    # A trapped signal interrupts wait; wait again for the graceful exit.
+    if [ -n "$stopping" ]; then wait "$child" 2>/dev/null || true; break; fi
+    # 75: pangpangd exited on `pp request-restart`; start the new code now.
+    if [ "$rc" = 75 ]; then say "restart requested; starting $name"; backoff=5; continue; fi
+    if [ $(( $(date +%s) - started )) -gt 300 ]; then backoff=5; fi
+    say "$name exited (rc $rc); restarting in ${backoff}s"
+    sleep "$backoff" & wait $! || true
+    backoff=$(( backoff * 2 > 300 ? 300 : backoff * 2 ))
+  done
+  rm -f "$RUN/$svc.pid"
+  say "$svc supervisor stopped"
+}
+
+svc_up() {
+  local svc=$1 pid i name
+  name=$(svc_name "$svc")
+  if pid=$(svc_pid "$svc"); then echo "$name already running (pid $pid)"; return 0; fi
+  if [ "$svc" = caveman ] && [ ! -x "$CAVEMAN_HOME/bin/caveman-proxy" ]; then
+    echo "$name not built; run ./bootstrap.sh (pangpang works without it, uncompressed)" >&2
+    return 0
+  fi
+  # 8>&-: the supervisor must not inherit pp.lock, or it would hold it forever.
+  setsid "$PP_HOME/bin/pp" _supervise "$svc" 8>&- >>"$(svc_log "$svc")" 2>&1 </dev/null &
+  for i in $(seq 50); do
+    pid=$(svc_pid "$svc") && { echo "$name started (pid $pid)"; return 0; }
+    sleep 0.2
+  done
+  echo "$name failed to start; see $(svc_log "$svc")" >&2
+  return 1
+}
+
+svc_down() {
+  local svc=$1 pid i name
+  name=$(svc_name "$svc")
+  if ! pid=$(svc_pid "$svc"); then echo "$name not running"; return 0; fi
+  # The supervisor forwards TERM for a graceful shutdown; if it is gone,
+  # signal its process group (the service) directly.
+  kill -TERM "$pid" 2>/dev/null || kill -TERM -- "-$pid" 2>/dev/null || true
+  for i in $(seq 150); do
+    svc_pid "$svc" >/dev/null || { echo "$name stopped"; return 0; }
+    sleep 0.2
+  done
+  kill -KILL -- "-$pid" 2>/dev/null || true
+  echo "$name killed after 30s"
+}
+
+cmd_up() {
+  with_lock
+  local svc rc=0
+  for svc in $SERVICES_UP; do svc_up "$svc" || rc=1; done
+  return $rc
+}
+
+cmd_down() {
+  with_lock
+  local svc
+  for svc in $SERVICES_DOWN; do svc_down "$svc"; done
+}
+
+cmd_restart() { cmd_down; cmd_up; }
+cmd_request_restart() {
+  touch "$RUN/restart-requested"
+  echo "restart requested: pangpangd restarts once every chat is idle"
+}
+cmd_pause()  { touch "$RUN/paused"; echo "paused: cron tasks and background review are skipped"; }
+cmd_resume() { rm -f "$RUN/paused"; echo resumed; }
+
+cmd_status() {
+  local rc=0 pid svc
+  for svc in $SERVICES_UP; do
+    if pid=$(svc_pid "$svc"); then
+      printf '%-8s running (supervisor pid %s, since %s)\n' "$svc" "$pid" "$(ps -o lstart= -p "$pid" 2>/dev/null || echo '?')"
+    else
+      printf '%-8s stopped\n' "$svc"; [ "$svc" = daemon ] && rc=1
+    fi
+  done
+  [ -e "$RUN/paused" ] && echo "state    PAUSED" || echo "state    active"
+  printf 'tasks    %s\n' "$(find "$TASKS" -maxdepth 1 -name '*.json' | wc -l)"
+  printf 'hooks    %s\n' "$(find "$PP_HOME/data/hooks" -maxdepth 1 -name '*.json' 2>/dev/null | wc -l)"
+  printf 'chats    %s\n' "$(find "$PP_HOME/data/chats" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)"
+  if [ -f "$(svc_log daemon)" ]; then echo "log      $(tail -n 1 "$(svc_log daemon)" | cut -c1-150)"; fi
+  return $rc
+}
+
+cmd_logs() { exec tail -n 80 -F "$(svc_log "${1:-daemon}")"; }
+
+cmd_add() {
+  local text id
+  if [ "${1:-}" = - ]; then text=$(cat); else text="$*"; fi
+  [ -n "$text" ] || { echo "usage: pp add TEXT... | pp add - < file" >&2; exit 2; }
+  id="pp-$(date +%Y%m%d-%H%M%S)-$$"
+  # A one-shot task due now: wakes the agent in the owner's chat.
+  jq -n --arg text "$text" --arg at "$(date -Iseconds)" '{at: $at, do: {agent: $text}}' > "$TASKS/.$id.json"
+  mv "$TASKS/.$id.json" "$TASKS/$id.json"   # atomic: the scheduler never sees half a file
+  echo "queued $id"
+  daemon_pid >/dev/null || echo "note: pangpangd is not running (pp up)"
+}
+
+cmd_tasks() {
+  local f
+  for f in "$TASKS"/*.json "$PP_HOME"/data/hooks/*.json; do
+    [ -e "$f" ] || continue
+    printf '%-6s %-32s %s\n' "$(basename "$(dirname "$f")")" "$(basename "$f" .json)" \
+      "$(jq -c '{schedule, at, match, do: (.do | keys[0])} | with_entries(select(.value != null))' "$f")"
+  done
+  tail -n 5 "$PP_VAR/logs/automation.jsonl" 2>/dev/null | sed 's/^/recent  /'
+}
+
+cmd_chat() { cd "$PP_HOME"; exec pi "$@"; }
+
+cmd_run() {
+  [ $# -gt 0 ] || { echo "usage: pp run PROMPT" >&2; exit 2; }
+  cd "$PP_HOME"
+  pi -p -- "$*" 2>&1 | tee "$PP_VAR/logs/run-$(date +%Y%m%d-%H%M%S).log"
+}
+
+cmd_check() { cd "$PP_HOME"; exec npx --no-install tsc --noEmit -p .; }
+
+# The embedding model needs ~400 MB while loaded, so it runs here, niced and
+# single-threaded, never inside pangpangd.  One run at a time.
+cmd_embed() {
+  exec 7>"$RUN/embed.lock"
+  flock -n 7 || { echo "embed already running"; return 0; }
+  local avail
+  avail=$(awk '/^MemAvailable:/ {print int($2 / 1024)}' /proc/meminfo)
+  if [ "${avail:-0}" -lt "${PP_EMBED_MIN_FREE_MB:-800}" ]; then
+    echo "embed skipped: only ${avail} MB available (needs ${PP_EMBED_MIN_FREE_MB:-800}); try again later"
+    return 0
+  fi
+  nice -n 19 node --disable-warning=ExperimentalWarning "$PP_HOME/src/recall-embed.ts" "$@"
+}
+
+cmd_recall() {
+  [ $# -gt 0 ] || { echo "usage: pp recall TEXT" >&2; exit 2; }
+  node --disable-warning=ExperimentalWarning --input-type=module -e '
+    const { recallBlock } = await import(process.env.PP_HOME + "/src/recall.ts");
+    console.log(recallBlock(process.argv[1]) || "(nothing relevant)");' "$*"
+}
+
+cmd_doctor() {
+  local fail=0
+  ok()  { printf '  ok    %s\n' "$*"; }
+  bad() { printf '  FAIL  %s\n' "$*"; fail=1; }
+  have() {
+    local p
+    p=$(command -v "$1" 2>/dev/null) || { bad "$1 missing"; return; }
+    case $p in "$PP_HOME"/*) ok "$1 -> ${p#"$PP_HOME"/}";; *) bad "$1 resolves outside project: $p";; esac
+  }
+
+  echo "toolchain"
+  for t in node npm pi direnv git rg fd jq curl python uv tmux; do have "$t"; done
+  ok "node $(node --version), pi $(pi --version 2>/dev/null)"
+  for t in flock setsid; do command -v "$t" >/dev/null && ok "$t (system)" || bad "$t missing"; done
+
+  echo "paths"
+  for v in TERMINFO TMPDIR XDG_CACHE_HOME npm_config_cache PI_CODING_AGENT_DIR PI_CODING_AGENT_SESSION_DIR; do
+    case ${!v} in "$PP_HOME"/*) ok "$v";; *) bad "$v=${!v} is outside project";; esac
+  done
+  [ -e "$HOME/.pi" ] && bad "$HOME/.pi exists: something ran pi outside the project env"
+
+  echo "disk"
+  local root_free
+  root_free=$(df -Pm / | awk 'NR==2 {print $4}')
+  if [ "$root_free" -lt 500 ]; then bad "/ has only ${root_free}M free"; else ok "/ ${root_free}M free"; fi
+  ok "project $(du -sh "$PP_HOME" 2>/dev/null | cut -f1)"
+
+  echo "secrets (.env)"
+  for v in XIAOMI_API_KEY TELEGRAM_BOT_TOKEN TELEGRAM_ALLOWED_USERS; do
+    if [ -n "${!v:-}" ]; then ok "$v set"; else bad "$v unset (see .env.example)"; fi
+  done
+
+  echo "caveman"
+  if [ -x "$CAVEMAN_HOME/bin/caveman-proxy" ]; then ok "binaries $(cat "$CAVEMAN_HOME/bin/.rev" 2>/dev/null)"; else bad "caveman not built (run ./bootstrap.sh)"; fi
+  if curl -fsS -m 3 -o /dev/null "$CAVE_GATEWAY_URL/health/live" 2>/dev/null; then ok "proxy live at $CAVE_GATEWAY_URL"; else bad "proxy not answering at $CAVE_GATEWAY_URL"; fi
+
+  echo "services"
+  cmd_status | sed 's/^/  /' || true
+
+  return $fail
+}
+
+cmd_update() { exec "$PP_HOME/bootstrap.sh"; }
+
+sub=${1:-status}
+[ $# -gt 0 ] && shift
+case $sub in
+  up|down|restart|pause|resume|status|logs|add|tasks|chat|run|recall|embed|check|doctor|update|_supervise) "cmd_$sub" "$@" ;;
+  request-restart) cmd_request_restart ;;
+  -h|--help|help) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) echo "unknown command: $sub (see pp help)" >&2; exit 2 ;;
+esac; exit $?
+# ^ `exit` on the same line: bash reads a running script lazily, so the
+# long-lived supervisor must never read past this point after the file is
+# edited (pangpang upgrades itself) or it would execute the new bytes.

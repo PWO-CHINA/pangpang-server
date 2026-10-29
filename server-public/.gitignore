@@ -1,0 +1,30 @@
+# Default deny: only reviewed source and templates are tracked.
+/*
+!/.gitignore
+!/README.md
+!/.env.example
+!/.envrc
+!/LICENSE
+!/NOTICE
+!/package.json
+!/package-lock.json
+!/tsconfig.json
+!/environment.yml
+!/bootstrap.sh
+!/src/
+!/bin/
+!/test/
+!/examples/
+!/agent/
+/agent/*
+!/agent/*.example
+
+# Runtime and user-created content must remain private.
+/data/
+/var/
+/.tools/
+/node_modules/
+/.env
+/agent/memory/
+/agent/skills/
+/agent/auth.json
