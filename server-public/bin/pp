@@ -22,6 +22,7 @@
 #
 # Maintenance:
 #   pp doctor         check toolchain, paths, disk, secrets, daemon
+#   pp weixin login|status  bind Weixin or inspect its connection
 #   pp check          typecheck src/
 #   pp update         re-run ./bootstrap.sh
 set -euo pipefail
@@ -252,7 +253,7 @@ cmd_doctor() {
   for t in flock setsid; do command -v "$t" >/dev/null && ok "$t (system)" || bad "$t missing"; done
 
   echo "paths"
-  for v in TERMINFO TMPDIR XDG_CACHE_HOME npm_config_cache PI_CODING_AGENT_DIR PI_CODING_AGENT_SESSION_DIR; do
+  for v in TERMINFO TMPDIR XDG_CACHE_HOME npm_config_cache PI_CODING_AGENT_DIR PI_CODING_AGENT_SESSION_DIR OPENCLAW_STATE_DIR OPENCLAW_CONFIG_PATH OPENCLAW_OAUTH_DIR; do
     case ${!v} in "$PP_HOME"/*) ok "$v";; *) bad "$v=${!v} is outside project";; esac
   done
   [ -e "$HOME/.pi" ] && bad "$HOME/.pi exists: something ran pi outside the project env"
@@ -278,12 +279,18 @@ cmd_doctor() {
   return $fail
 }
 
+cmd_weixin() {
+  local action=${1:-status}
+  node --disable-warning=ExperimentalWarning "$PP_HOME/src/channels/weixin-cli.ts" "$action"
+  if [ "$action" = login ]; then cmd_request_restart; fi
+}
+
 cmd_update() { exec "$PP_HOME/bootstrap.sh"; }
 
 sub=${1:-status}
 [ $# -gt 0 ] && shift
 case $sub in
-  up|down|restart|pause|resume|status|logs|add|tasks|chat|run|recall|embed|check|doctor|update|_supervise) "cmd_$sub" "$@" ;;
+  up|down|restart|pause|resume|status|logs|add|tasks|chat|run|recall|embed|weixin|check|doctor|update|_supervise) "cmd_$sub" "$@" ;;
   request-restart) cmd_request_restart ;;
   -h|--help|help) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//' ;;
   *) echo "unknown command: $sub (see pp help)" >&2; exit 2 ;;

@@ -1,7 +1,7 @@
 // Actions shared by the event model (webhooks, src/automation/hooks.ts) and
 // the task model (cron, src/automation/tasks.ts).  Cheapest first:
 //
-//   { "notify": "template" }                 text to Telegram; no model call
+//   { "notify": "template" }                 text to the notification pool; no model call
 //   { "run": "shell", "then": "notify" }     a command; its output decides what happens
 //   { "agent": "template" }                  a model turn in the chat
 //
@@ -17,8 +17,8 @@ import { PP_HOME, paths } from "../config.ts";
 import { errorText, log } from "../log.ts";
 import { sendBark, sendEmail } from "../notify.ts";
 
-/** Where a notify action (and run output) goes: the chat (default), Bark, or email. */
-export type Via = "telegram" | "bark" | "email";
+/** Where an action is delivered. An omitted via uses the pool on new runtimes. */
+export type Via = "pool" | "telegram" | "weixin" | "bark" | "email";
 
 export type Action =
 	| { notify: string; via?: Via; title?: string; chat?: string }
@@ -32,6 +32,10 @@ export interface ActionRuntime {
 	wake(chatId: string, text: string): Promise<void>;
 	/** Owner chat, used when an action names none. */
 	defaultChat(): string | undefined;
+	/** Route a notification explicitly; pool does not need a Telegram chat id. */
+	notifyVia?(text: string, via: Via, chat?: string, source?: string, title?: string): Promise<void>;
+	/** Start a background event session. targetChat is a delivery target, not the session key. */
+	wakeSource?(source: string, text: string, targetChat?: string): Promise<void>;
 }
 
 export type Match = Record<string, string | number | boolean | { re: string } | { in: unknown[] } | { exists: boolean }>;
@@ -114,44 +118,78 @@ function record(source: string, kind: string, outcome: string, startedAt: number
 	}
 }
 
-async function deliver(rt: ActionRuntime, chat: string, action: { via?: Via; title?: string }, source: string, text: string): Promise<void> {
+function deliveryRoute(rt: ActionRuntime, action: { via?: Via; chat?: string }): { via: Via; chat?: string } {
+	if (action.via === "bark" || action.via === "email") return { via: action.via };
+	if (action.via === "weixin") return { via: "weixin", chat: action.chat };
+	if (action.chat) return { via: "telegram", chat: action.chat };
+	if (action.via === "telegram") return { via: "telegram", chat: action.chat ?? rt.defaultChat() };
+	if (action.via === "pool" || rt.notifyVia) return { via: "pool" };
+	// Compatibility with runtimes that only implement notify(chat, text).
+	return { via: "telegram", chat: rt.defaultChat() };
+}
+
+async function deliver(rt: ActionRuntime, action: { via?: Via; title?: string; chat?: string }, source: string, text: string): Promise<void> {
 	const title = action.title ?? `pangpang: ${source}`;
-	if (action.via === "bark") await sendBark({ title, body: text });
-	else if (action.via === "email") await sendEmail(title, text);
-	else await rt.notify(chat, text);
+	const route = deliveryRoute(rt, action);
+	if (route.via === "bark") {
+		await sendBark({ title, body: text });
+		return;
+	}
+	if (route.via === "email") {
+		await sendEmail(title, text);
+		return;
+	}
+	if (rt.notifyVia) {
+		if (route.via === "telegram" && !route.chat) throw new Error("no Telegram recipient to deliver to");
+		await rt.notifyVia(text, route.via, route.chat, source, title);
+		return;
+	}
+	if (route.via === "weixin" || (action.via === "pool" && !action.chat)) {
+		throw new Error(`ActionRuntime.notifyVia is required for ${route.via} delivery`);
+	}
+	if (!route.chat) throw new Error("no chat to deliver to (set TELEGRAM_ALLOWED_USERS)");
+	await rt.notify(route.chat, text);
+}
+
+async function wake(rt: ActionRuntime, source: string, text: string, targetChat?: string): Promise<void> {
+	if (rt.wakeSource) {
+		await rt.wakeSource(source, text, targetChat);
+		return;
+	}
+	const legacyChat = targetChat ?? rt.defaultChat();
+	if (!legacyChat) throw new Error("no chat to deliver to (set TELEGRAM_ALLOWED_USERS)");
+	await rt.wake(legacyChat, text);
 }
 
 /** Execute one action.  Never throws; failures are logged and recorded. */
 export async function runAction(source: string, action: Action, ctx: unknown, rt: ActionRuntime): Promise<string> {
 	const started = Date.now();
-	const chat = action.chat ?? rt.defaultChat();
 	let outcome = "ok";
 	let kind = "invalid";
 	try {
-		if (!chat) throw new Error("no chat to deliver to (set TELEGRAM_ALLOWED_USERS)");
 		if ("notify" in action) {
 			kind = "notify";
-			await deliver(rt, chat, action, source, render(action.notify, ctx));
+			await deliver(rt, action, source, render(action.notify, ctx));
 		} else if ("run" in action) {
 			kind = "run";
 			const { code, out } = await runCommand(action.run, JSON.stringify(ctx), action.timeoutSec ?? 600);
 			const silent = out === "" || out === "NO_REPLY";
 			if (code !== 0) {
 				outcome = `exit ${code}`;
-				await rt.notify(chat, `⚠️ ${source} failed (exit ${code})\n\`\`\`\n${out.slice(-3000)}\n\`\`\``);
+				await deliver(rt, action, source, `⚠️ ${source} failed (exit ${code})\n\`\`\`\n${out.slice(-3000)}\n\`\`\``);
 			} else if (silent || action.then === "silent") {
 				outcome = "silent";
 			} else if (action.then === "agent") {
 				outcome = "woke agent";
 				const intro = action.prompt ? render(action.prompt, ctx) : `Output of ${source}:`;
-				await rt.wake(chat, `[EVENT:${source}] ${intro}\n\n<output>\n${out}\n</output>`);
+				await wake(rt, source, `[EVENT:${source}] ${intro}\n\n<output>\n${out}\n</output>`, action.chat);
 			} else {
 				outcome = "notified";
-				await deliver(rt, chat, action, source, out);
+				await deliver(rt, action, source, out);
 			}
 		} else if ("agent" in action) {
 			kind = "agent";
-			await rt.wake(chat, `[EVENT:${source}] ${render(action.agent, ctx)}`);
+			await wake(rt, source, `[EVENT:${source}] ${render(action.agent, ctx)}`, action.chat);
 		} else {
 			throw new Error("action needs one of notify, run, agent");
 		}

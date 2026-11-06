@@ -63,9 +63,11 @@ export class HookServer {
 	private rt: ActionRuntime;
 	private server: Server | undefined;
 	private lastFired = new Map<string, number>();
+	private host: string;
 
-	constructor(rt: ActionRuntime) {
+	constructor(rt: ActionRuntime, host = "0.0.0.0") {
 		this.rt = rt;
+		this.host = host;
 	}
 
 	start(): void {
@@ -81,7 +83,7 @@ export class HookServer {
 				});
 		});
 		this.server.on("error", (err) => log.error("hooks", "server error", err));
-		this.server.listen(settings.hookPort, "0.0.0.0", () => log.info("hooks", `listening on :${settings.hookPort}`));
+		this.server.listen(settings.hookPort, this.host, () => log.info("hooks", `listening on ${this.host}:${settings.hookPort}`));
 	}
 
 	stop(): void {

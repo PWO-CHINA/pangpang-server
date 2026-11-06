@@ -11,15 +11,20 @@ import { renderMemorySnapshot } from "./memory.ts";
 import { runCommand } from "./automation/actions.ts";
 import { cancelJob, formatJob, listJobs, startJob } from "./delegate/jobs.ts";
 import type { TaskScheduler } from "./automation/tasks.ts";
-import type { Telegram } from "./telegram.ts";
+import type { ChatTransport, NotificationSink } from "./channels/types.ts";
 
 export interface CommandContext {
-	tg: Telegram;
+	tg: ChatTransport;
 	conv: Conversation;
 	tasks: TaskScheduler;
 	chatId: string;
+	/** Actual destination for this client; chatId remains the conversation key. */
+	recipient?: string;
 	fromId: string;
+	notifications?: NotificationSink;
 }
+
+const recipient = (ctx: CommandContext) => ctx.recipient ?? ctx.conv.recipient ?? ctx.chatId;
 
 interface Command {
 	name: string;
@@ -95,10 +100,10 @@ const COMMANDS: Command[] = [
 		name: "btw",
 		args: "<question>",
 		description: "Side question; does not touch the context",
-		async run({ conv, tg, chatId }, args) {
+		async run(ctx, args) {
 			if (!args) return "usage: /btw <question>";
-			void tg.typing(chatId);
-			return conv.btw(args);
+			void ctx.tg.typing(recipient(ctx)).catch(() => {});
+			return ctx.conv.btw(args);
 		},
 	},
 	{
@@ -138,13 +143,17 @@ const COMMANDS: Command[] = [
 			name: agent,
 			args: "<task>",
 			description: `Send a task straight to ${agent === "codex" ? "Codex" : "Claude Code"} (no pangpang tokens)`,
-			async run({ tg, chatId, conv }, args) {
+			async run(ctx, args) {
 				if (!args) return `usage: /${agent} <task>; it runs in the background and replies here`;
 				const job = startJob({
 					agent,
 					task: args,
-					cwd: conv.scratch,
-					onDone: (j) => tg.send(chatId, formatJob(j)).then(() => {}),
+					cwd: ctx.conv.scratch,
+					onDone: async (j) => {
+						const text = formatJob(j);
+						if (ctx.notifications) await ctx.notifications.notify(text, { via: "pool", source: `${agent} job` });
+						else await ctx.tg.send(recipient(ctx), text);
+					},
 				});
 				return `${job.id} started. /jobs to watch, /cancel ${job.id} to stop.`;
 			},
@@ -174,6 +183,24 @@ const COMMANDS: Command[] = [
 		description: "Show persistent memory",
 		async run() {
 			return code(renderMemorySnapshot());
+		},
+	},
+	{
+		name: "notify",
+		args: "[broadcast on|off]",
+		description: "Notification pool status and broadcast setting",
+		async run({ notifications }, args) {
+			if (!notifications) return "notification pool unavailable";
+			if (args === "broadcast on") {
+				notifications.setBroadcast(true);
+				return "notification broadcast on";
+			}
+			if (args === "broadcast off") {
+				notifications.setBroadcast(false);
+				return "notification broadcast off";
+			}
+			if (args) return "usage: /notify [broadcast on|off]";
+			return notifications.status();
 		},
 	},
 	{
@@ -226,9 +253,9 @@ const COMMANDS: Command[] = [
 		name: "bash",
 		args: "<command>",
 		description: "Run a shell command (also: !command)",
-		async run({ tg, chatId }, args) {
+		async run(ctx, args) {
 			if (!args) return "usage: /bash <command>";
-			void tg.typing(chatId);
+			void ctx.tg.typing(recipient(ctx)).catch(() => {});
 			const { code: exit, out } = await runCommand(args, "", 120);
 			return `${exit === 0 ? "" : `exit ${exit}\n`}${code(out || "(no output)")}`;
 		},
@@ -244,9 +271,9 @@ const COMMANDS: Command[] = [
 	{
 		name: "whoami",
 		aliases: ["id"],
-		description: "Your Telegram ids",
-		async run({ chatId, fromId }) {
-			return `user ${fromId}, chat ${chatId}`;
+		description: "Your client ids",
+		async run(ctx) {
+			return `user ${ctx.fromId}, chat ${recipient(ctx)}`;
 		},
 	},
 	{
@@ -290,6 +317,6 @@ export async function handleCommand(text: string, ctx: CommandContext): Promise<
 	} catch (err) {
 		reply = `/${command.name} failed: ${errorText(err)}`;
 	}
-	if (reply) await ctx.tg.send(ctx.chatId, reply);
+	if (reply) await ctx.tg.send(recipient(ctx), reply);
 	return true;
 }

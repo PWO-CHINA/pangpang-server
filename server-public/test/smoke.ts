@@ -1,15 +1,22 @@
-// End-to-end smoke test for pangpangd without Telegram.
+// End-to-end smoke test for pangpangd without production chat clients.
 //
 //   PP_VAR=var/tmp/smoke node --disable-warning=ExperimentalWarning test/smoke.ts [--live]
 //
 // Unit checks run offline.  --live also runs real model turns through a
-// Conversation with a fake Telegram client, then a manual compaction.
+// Conversation with a fake client, then a manual compaction.
 
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve, sep } from "node:path";
 
 const live = process.argv.includes("--live");
+
+// A repeated smoke run must not reuse memory or indexes from an earlier run.
+const scratch = resolve(process.env.PP_VAR ?? "");
+const scratchRoot = resolve(process.env.PP_HOME!, "var", "tmp");
+assert.ok(scratch.startsWith(`${scratchRoot}${sep}`) && scratch.includes("smoke"), "PP_VAR must be a smoke directory under PP_HOME/var/tmp");
+rmSync(scratch, { recursive: true, force: true });
+mkdirSync(scratch, { recursive: true });
 
 // A throwaway agent dir whose tiny keepRecentTokens lets a short
 // conversation be compacted.
@@ -162,6 +169,35 @@ console.log("ok formatting");
 	assert.match(got[2], /^wake:\[EVENT:t\] Check opened\n\n<output>\nfound/);
 	assert.match(got[3], /failed \(exit 3\)/);
 
+	const routed: string[] = [];
+	const routedRt = {
+		notify: async (_c: string, t: string) => void routed.push(`legacy-notify:${t}`),
+		wake: async (_c: string, t: string) => void routed.push(`legacy-wake:${t}`),
+		defaultChat: () => "default-telegram",
+		notifyVia: async (t: string, via: string, chat?: string, source?: string) =>
+			void routed.push(`via:${via}:${chat ?? "(none)"}:${source}:${t}`),
+		wakeSource: async (source: string, t: string, targetChat?: string) =>
+			void routed.push(`source:${source}:${targetChat ?? "(none)"}:${t}`),
+	};
+	await runAction("pool-default", { notify: "pool message" }, ctx, routedRt);
+	await runAction("fixed-chat", { notify: "telegram message", chat: "fixed-telegram" }, ctx, routedRt);
+	await runAction("fixed-pool", { notify: "telegram pool override", via: "pool", chat: "pool-telegram" }, ctx, routedRt);
+	await runAction("wx-route", { notify: "weixin message", via: "weixin" }, ctx, routedRt);
+	await runAction("wx-target", { notify: "weixin target", via: "weixin", chat: "fixed-weixin" }, ctx, routedRt);
+	await runAction("background", { agent: "inspect" }, ctx, routedRt);
+	await runAction("background-target", { agent: "inspect", chat: "delivery-target" }, ctx, routedRt);
+	const failedOutcome = await runAction("failed-pool", { run: "exit 9" }, ctx, routedRt);
+	assert.match(routed[0], /^via:pool:\(none\):pool-default:pool message$/);
+	assert.match(routed[1], /^via:telegram:fixed-telegram:fixed-chat:telegram message$/);
+	assert.match(routed[2], /^via:telegram:pool-telegram:fixed-pool:telegram pool override$/);
+	assert.match(routed[3], /^via:weixin:\(none\):wx-route:weixin message$/);
+	assert.match(routed[4], /^via:weixin:fixed-weixin:wx-target:weixin target$/);
+	assert.match(routed[5], /^source:background:\(none\):\[EVENT:background\] inspect$/);
+	assert.match(routed[6], /^source:background-target:delivery-target:/);
+	assert.match(routed[7], /^via:pool:\(none\):failed-pool:⚠️ failed-pool failed \(exit 9\)/);
+	assert.equal(routed.some((entry) => entry.includes("default-telegram:pool message")), false, "default pool delivery must not inherit the Telegram chat");
+	assert.equal(failedOutcome, "exit 9", "failed shell stays a completed failure, not a rerun");
+
 	const { TaskScheduler } = await import("../src/automation/tasks.ts");
 	got.length = 0;
 	writeFileSync(join(paths.tasks, "soon.json"), JSON.stringify({ at: new Date(Date.now() + 300).toISOString(), do: { notify: "ding" } }));
@@ -184,7 +220,7 @@ console.log("ok formatting");
 		JSON.stringify({ token: "s3", match: { action: "opened" }, cooldownSec: 60, do: { notify: "issue: {{issue.title}}" } }),
 	);
 	got.length = 0;
-	const hooks = new HookServer(rt);
+	const hooks = new HookServer(rt, "127.0.0.1");
 	hooks.start();
 	await new Promise((r) => setTimeout(r, 200));
 	const post = (token: string, body: unknown) =>
@@ -197,6 +233,183 @@ console.log("ok formatting");
 	assert.deepEqual(got, ["notify:issue: Disk full"]);
 	hooks.stop();
 	console.log("ok automation");
+}
+
+// Commands always reply in the original bound client destination.
+{
+	const { handleCommand } = await import("../src/commands.ts");
+	const sent: { chat: string; text: string }[] = [];
+	const settings: string[] = [];
+	const notifications = {
+		notify: async () => {},
+		status: () => "pool: telegram + weixin",
+		setBroadcast: (enabled: boolean) => void settings.push(String(enabled)),
+		touch: () => {},
+		retryPending: async () => {},
+	};
+	const ctx: any = {
+		tg: { send: async (chat: string, text: string) => (sent.push({ chat, text }), sent.length), typing: async () => {} },
+		conv: {},
+		tasks: {},
+		chatId: "stored-session-key",
+		recipient: "bound-client-peer",
+		fromId: "client-user",
+		notifications,
+	};
+	assert.equal(await handleCommand("/whoami", ctx), true);
+	assert.deepEqual(sent[0], { chat: "bound-client-peer", text: "user client-user, chat bound-client-peer" });
+	await handleCommand("/notify", ctx);
+	assert.deepEqual(sent[1], { chat: "bound-client-peer", text: "pool: telegram + weixin" });
+	await handleCommand("/notify broadcast off", ctx);
+	assert.deepEqual(settings, ["false"]);
+	assert.equal(sent[2].chat, "bound-client-peer");
+	console.log("ok commands");
+}
+
+// Real Conversation.handle/run routing with an in-memory Session and no model calls.
+{
+	const { Conversation } = await import("../src/conversation.ts");
+	const records = (channel: "telegram" | "weixin") => ({
+		channel,
+		sent: [] as { chat: string; text: string }[],
+		files: [] as { chat: string; path: string; caption?: string }[],
+		typing: 0,
+		releaseSend: undefined as (() => void) | undefined,
+		blockNextSend: false,
+	});
+	const transport = (r: ReturnType<typeof records>, supportsEdits: boolean) => ({
+		channel: r.channel,
+		supportsEdits,
+		messageLimit: 3800,
+		send: async (chat: string, text: string) => {
+			r.sent.push({ chat, text });
+			if (r.blockNextSend) {
+				r.blockNextSend = false;
+				await new Promise<void>((resolve) => (r.releaseSend = resolve));
+			}
+			return r.sent.length;
+		},
+		edit: async () => {},
+		remove: async () => {},
+		typing: async () => void r.typing++,
+		sendFile: async (chat: string, path: string, caption?: string) => void r.files.push({ chat, path, caption }),
+		download: async () => {},
+	});
+	const poolCalls: { text: string; options?: any }[] = [];
+	const notifications = {
+		notify: async (text: string, options?: any) => void poolCalls.push({ text, options }),
+		status: () => "pool available",
+		setBroadcast: () => {},
+		touch: () => {},
+		retryPending: async () => {},
+	};
+	const review = { schedule() {}, cancel() {} };
+	const makeConversation = (key: string, recipient: string, client: ReturnType<typeof records>, supportsEdits: boolean, sink?: typeof notifications) => {
+		const dir = join(paths.chats, key);
+		mkdirSync(join(dir, "scratch"), { recursive: true });
+		mkdirSync(join(dir, "attachments"), { recursive: true });
+		const conv = Object.create(Conversation.prototype) as any;
+		Object.assign(conv, {
+			chatId: key,
+			recipient,
+			dir,
+			scratch: join(dir, "scratch"),
+			transport: transport(client, supportsEdits),
+			notifications: sink,
+			channel: client.channel,
+			review,
+			snapshot: "",
+			needsReload: false,
+			reply: undefined,
+			lastAssistant: undefined,
+			queue: Promise.resolve(),
+			runningRuns: 0,
+			pendingRuns: 0,
+			activeEventTurn: false,
+			triggerStatus: true,
+			nextReply: "",
+			preToolTexts: [] as string[],
+			attachNext: undefined,
+		});
+		conv.session = {
+			get isStreaming() { return false; },
+			messages: [],
+			prompt: async () => {
+				if (conv.triggerStatus) conv.onEvent({ type: "tool_execution_start", toolName: "exec", args: { command: "printf ok" } });
+				if (conv.attachNext) {
+					const attachment = conv.attachNext;
+					conv.attachNext = undefined;
+					await conv.attach(attachment.path, attachment.caption);
+				}
+				// Emit the same events the real session does, one assistant message per
+				// text fragment, so multi-part turns are exercised end to end.
+				for (const text of conv.preToolTexts ?? []) {
+					conv.onEvent({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text }], stopReason: "toolUse" } });
+				}
+				conv.onEvent({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: conv.nextReply }], stopReason: "stop" } });
+			},
+			dispose() {},
+		};
+		return conv;
+	};
+
+	const tgRecords = records("telegram");
+	const tg = makeConversation("routing-telegram", "telegram-recipient", tgRecords, true);
+	tg.nextReply = "telegram-owner-reply";
+	tg.attachNext = { path: "telegram-file", caption: "owner attachment" };
+	await tg.handle({ text: "owner turn", name: "owner", date: new Date() });
+	assert.deepEqual(tgRecords.sent, [{ chat: "telegram-recipient", text: "telegram-owner-reply" }]);
+	assert.deepEqual(tgRecords.files, [{ chat: "telegram-recipient", path: "telegram-file", caption: "owner attachment" }]);
+	assert.equal(tg.busy, false);
+	await tg.dispose();
+
+	// A turn that writes, calls a tool, then writes again must deliver both parts:
+	// the first block used to be dropped because only the last message was sent.
+	const partsRecords = records("telegram");
+	const parts = makeConversation("routing-telegram-parts", "telegram-recipient", partsRecords, true);
+	parts.preToolTexts = ["查了日志，根因在 conversation.ts。"];
+	parts.nextReply = "修好了。";
+	await parts.handle({ text: "owner turn", name: "owner", date: new Date() });
+	assert.deepEqual(partsRecords.sent, [
+		{ chat: "telegram-recipient", text: "查了日志，根因在 conversation.ts。\n修好了。" },
+	], "text written before a tool call is not dropped");
+	await parts.dispose();
+
+	const wxRecords = records("weixin");
+	const wx = makeConversation("routing-weixin", "weixin-recipient", wxRecords, false, notifications);
+	wx.nextReply = "weixin-owner-reply";
+	wx.attachNext = { path: "weixin-file", caption: "owner attachment" };
+	wxRecords.blockNextSend = true;
+	const firstTurn = wx.handle({ text: "owner turn", name: "owner", date: new Date() });
+	while (!wxRecords.releaseSend) await new Promise<void>((resolve) => setImmediate(() => resolve()));
+	assert.equal(wx.busy, true, "conversation stays busy while the final reply is being delivered");
+	wx.nextReply = "weixin-queued-reply";
+	const queuedTurn = wx.handle({ text: "queued owner turn", name: "owner", date: new Date() });
+	assert.equal(wx.busy, true, "queued owner work keeps the conversation busy");
+	wxRecords.releaseSend!();
+	await firstTurn;
+	await queuedTurn;
+	assert.deepEqual(wxRecords.sent, [
+		{ chat: "weixin-recipient", text: "weixin-owner-reply" },
+		{ chat: "weixin-recipient", text: "weixin-queued-reply" },
+	], "Weixin suppresses tool status messages and sends only final owner replies");
+	assert.deepEqual(wxRecords.files, [{ chat: "weixin-recipient", path: "weixin-file", caption: "owner attachment" }]);
+	assert.equal(wx.busy, false, "conversation becomes idle after all queued replies are delivered");
+
+	const sentBeforeEvent = wxRecords.sent.length;
+	const typingBeforeEvent = wxRecords.typing;
+	wx.nextReply = "weixin-event-reply";
+	wx.attachNext = { path: "event-file", caption: "event attachment" };
+	await wx.handle({ text: "event turn", name: "job", date: new Date(), isEvent: true });
+	assert.equal(wxRecords.sent.length, sentBeforeEvent, "background event never replies in the original chat");
+	assert.equal(wxRecords.typing, typingBeforeEvent, "background event never shows typing in the original chat");
+	assert.deepEqual(poolCalls.slice(-2), [
+		{ text: "event attachment", options: { via: "pool", file: "event-file", caption: "event attachment", source: "conversation:routing-weixin" } },
+		{ text: "weixin-event-reply", options: { via: "pool", source: "conversation:routing-weixin" } },
+	]);
+	assert.equal(wx.busy, false);
+	await wx.dispose();
+	console.log("ok conversation routing");
 }
 
 // caveman routing of pool targets
@@ -269,16 +482,17 @@ console.log("ok formatting");
 if (live) {
 	const { Conversation } = await import("../src/conversation.ts");
 	const sent: string[] = [];
-	const fakeTg: any = {
-		send: async (_c: string, text: string) => (sent.push(text), sent.length),
+	const recipients: string[] = [];
+	const fakeTelegram: any = {
+		send: async (c: string, text: string) => (recipients.push(c), sent.push(text), sent.length),
 		edit: async () => {},
 		remove: async () => {},
 		typing: async () => {},
-		sendFile: async (_c: string, path: string) => void sent.push(`[file] ${path}`),
+		sendFile: async (c: string, path: string) => (recipients.push(c), void sent.push(`[file] ${path}`)),
 		download: async () => {},
 	};
 	const review = { schedule() {}, cancel() {} };
-	const conv = await Conversation.open("smoke", fakeTg, review);
+	const conv = await Conversation.open("smoke", fakeTelegram, review);
 
 	await conv.handle({ text: "Remember with the memory tool: my server hostname is demo-box. Then reply OK.", name: "owner", date: new Date() });
 	console.log("reply 1:", sent.at(-1));
@@ -310,7 +524,51 @@ if (live) {
 	assert.ok((pool["broken/down"]?.success ?? 1) < 1, "pool did not record the broken target's failure");
 	assert.equal(pool["deepseek/deepseek-v4-pro"]?.success, 1, "deepseek should have served every turn");
 	assert.ok(existsSync(join(paths.chats, "smoke", "log.jsonl")));
-	conv.dispose();
+	assert.ok(recipients.length > 0 && recipients.every((id) => id === "smoke"), "legacy three-argument open must keep the chat id as recipient");
+	await conv.dispose();
+
+	// A simulated Weixin session proves event routing without another model call.
+	const wxSent: { chat: string; text: string }[] = [];
+	const wxTyping = { value: 0 };
+	const routedNotifications: { text: string; via?: string; source?: string }[] = [];
+	const wxTransport: any = {
+		channel: "weixin",
+		supportsEdits: false,
+		send: async (chat: string, text: string) => (wxSent.push({ chat, text }), wxSent.length),
+		edit: async () => {},
+		remove: async () => {},
+		typing: async () => void wxTyping.value++,
+		sendFile: async (chat: string, path: string) => void wxSent.push({ chat, text: `[file] ${path}` }),
+		download: async () => {},
+	};
+	const wxNotifications = {
+		notify: async (text: string, options?: { via?: string; source?: string }) => void routedNotifications.push({ text, via: options?.via, source: options?.source }),
+		status: () => "pool available",
+		setBroadcast: () => {},
+		touch: () => {},
+		retryPending: async () => {},
+	};
+	const wx = await Conversation.open("smoke-weixin", wxTransport, review, {
+		recipient: "bound-weixin-peer",
+		channel: "weixin",
+		notifications: wxNotifications,
+	});
+	let simulatedTurn = 0;
+	(wx as any).session.prompt = async () => {
+		simulatedTurn++;
+		(wx as any).lastAssistant = {
+			role: "assistant",
+			content: [{ type: "text", text: simulatedTurn === 1 ? "event-routed" : "owner-routed" }],
+			stopReason: "stop",
+		};
+	};
+	await wx.handle({ text: "event", name: "job", date: new Date(), isEvent: true });
+	assert.equal(wxSent.length, 0, "event must not appear in the Weixin conversation transport");
+	assert.equal(wxTyping.value, 0, "event must not show typing on the conversation channel");
+	assert.deepEqual(routedNotifications.at(-1), { text: "event-routed", via: "pool", source: "conversation:smoke-weixin" });
+	await wx.handle({ text: "owner turn", name: "owner", date: new Date() });
+	assert.deepEqual(wxSent, [{ chat: "bound-weixin-peer", text: "owner-routed" }], "Weixin owner turn sends only its final reply to the bound recipient");
+	await wx.dispose();
 	console.log("ok live");
 }
 console.log("all smoke checks passed");

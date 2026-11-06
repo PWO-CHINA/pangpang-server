@@ -4,7 +4,7 @@
 // After a chat has been idle for a while following enough activity, a
 // separate short-lived pi session reads the unreviewed stretch of the
 // conversation and updates memory and skills.  It never talks in the chat
-// itself; it only posts a one-line silent note when it changed something.
+// itself. Its free-form output is internal housekeeping, never a notification.
 
 import {
 	type AgentSession,
@@ -23,19 +23,17 @@ import { errorText, log } from "./log.ts";
 import { renderMemorySnapshot } from "./memory.ts";
 import { REVIEW_PROMPT } from "./prompts.ts";
 import { createSession } from "./session.ts";
-import type { Telegram } from "./telegram.ts";
+import type { ChatTransport, NotificationSink } from "./channels/types.ts";
 
 /** Keep the transcript handed to the reviewer bounded. */
 const MAX_TRANSCRIPT_CHARS = 80_000;
 
 export class Reviewer implements ReviewHooks {
-	private tg: Telegram;
 	private timers = new Map<string, NodeJS.Timeout>();
 	private running: Promise<void> = Promise.resolve();
 
-	constructor(tg: Telegram) {
-		this.tg = tg;
-	}
+	// Keep the existing host constructor compatible; internal review has no delivery channel.
+	constructor(_transport?: ChatTransport, _notifications?: NotificationSink) {}
 
 	schedule(conv: Conversation): void {
 		this.cancel(conv);
@@ -110,7 +108,6 @@ export class Reviewer implements ReviewHooks {
 			log.info("review", `${conv.chatId}: ${result || "(no reply)"}`);
 			if (result && !/^nothing to save/i.test(result)) {
 				await commitGrowth(`review: ${result.split("\n")[0].slice(0, 120)}`);
-				await this.tg.send(conv.chatId, `🧠 ${result.slice(0, 500)}`, { silent: true });
 			}
 		} catch (err) {
 			log.warn("review", `${conv.chatId}: failed`, errorText(err));

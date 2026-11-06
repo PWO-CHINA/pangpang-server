@@ -18,6 +18,7 @@ import { recall } from "./recall.ts";
 import { searchLogs } from "./search.ts";
 import { sendBark, sendEmail } from "./notify.ts";
 import { manageSkill, type SkillRequest } from "./skills.ts";
+import type { NotificationSink } from "./channels/types.ts";
 
 export interface ExtensionHost {
 	/** Current frozen memory snapshot for the system prompt. */
@@ -26,6 +27,8 @@ export interface ExtensionHost {
 	refresh(): Promise<void>;
 	/** Send a file to the owner; undefined for sessions without a chat. */
 	attach?: (path: string, caption?: string) => Promise<void>;
+	/** Route notifications independently from the active conversation. */
+	notifications?: NotificationSink;
 	/** Count tool calls for the review trigger. */
 	onToolCall?: (name: string) => void;
 	/** Working directory used to resolve relative paths. */
@@ -132,7 +135,7 @@ export function pangpangExtension(host: ExtensionHost): ExtensionFactory {
 			pi.registerTool({
 				name: "attach",
 				label: "Send file",
-				description: "Send a file to the owner on Telegram (max 50 MB).",
+				description: "Send a file to the owner in the current client (max 50 MB).",
 				parameters: Type.Object({
 					path: Type.String({ description: "Path of the file to send." }),
 					caption: Type.Optional(Type.String()),
@@ -150,24 +153,45 @@ export function pangpangExtension(host: ExtensionHost): ExtensionFactory {
 			name: "notify",
 			label: "Notify owner",
 			description:
-				"Push a notification to the owner outside Telegram. Telegram is for conversation; use this " +
-				"for things that must reach the owner even when they are not chatting: alerts, reminders, " +
-				"finished long work. via 'bark' (iPhone push, default) or 'email' (longer content, records). " +
+				"Send a notification to the owner, independent of the current reply. Default via 'pool' chooses " +
+				"an available client channel. 'telegram' or 'weixin' selects that channel. Use this for alerts, " +
+				"reminders and finished long work. 'bark' (iPhone push) and 'email' (longer content, records) " +
+				"keep their existing delivery behavior. " +
 				"level for bark: passive (silent), active (default), timeSensitive (breaks focus), critical " +
 				"(breaks mute; real emergencies only).",
 			parameters: Type.Object({
 				title: Type.String(),
 				body: Type.String(),
-				via: Type.Optional(Type.Union([Type.Literal("bark"), Type.Literal("email")])),
+				via: Type.Optional(Type.Union([
+					Type.Literal("pool"),
+					Type.Literal("telegram"),
+					Type.Literal("weixin"),
+					Type.Literal("bark"),
+					Type.Literal("email"),
+				])),
+				chat: Type.Optional(Type.String({ description: "Explicit recipient for Telegram notifications." })),
 				level: Type.Optional(
 					Type.Union([Type.Literal("passive"), Type.Literal("active"), Type.Literal("timeSensitive"), Type.Literal("critical")]),
 				),
 				url: Type.Optional(Type.String({ description: "bark: link opened on tap" })),
 			}),
 			async execute(_id, params) {
-				if ((params.via ?? "bark") === "email") await sendEmail(params.title, params.body);
-				else await sendBark({ title: params.title, body: params.body, level: params.level, url: params.url });
-				return textResult(`sent via ${params.via ?? "bark"}`);
+				const via = params.via ?? "pool";
+				if (via === "email") await sendEmail(params.title, params.body);
+				else if (via === "bark") await sendBark({ title: params.title, body: params.body, level: params.level, url: params.url });
+				else {
+					if (!host.notifications) {
+						throw new Error(via === "pool"
+							? "notification pool unavailable: configure NotificationSink for this session"
+							: "notification routing unavailable: configure NotificationSink for this session");
+					}
+					await host.notifications.notify(`${params.title}\n\n${params.body}`, {
+						via,
+						chat: params.chat,
+						source: "notify tool",
+					});
+				}
+				return textResult(`${via === "bark" || via === "email" ? "sent" : "submitted"} via ${via}`);
 			},
 		});
 

@@ -44,6 +44,15 @@ interface AliasStreamDependencies {
 	onFailover(data: FailoverEntryData): void;
 }
 
+export interface AliasSourceIdentity {
+	provider: string;
+	api: string;
+	model: string;
+}
+
+type AliasAssistantMessage = AssistantMessage & { aliasSource?: AliasSourceIdentity };
+type HistorySourceIdentity = { provider: string; api?: string; model: string };
+
 export function createAliasStreams(dependencies: AliasStreamDependencies): ProviderStreams {
 	return {
 		stream(model, context, options) {
@@ -85,6 +94,7 @@ function createFallbackStream(
 	const { policy, configLoadMs, degraded } = policyFor(aliasModel.id);
 	const metadataByTarget = new Map<string, ProviderResponseMetadata>();
 	let lastPartial: AssistantMessage | undefined;
+	let activeTarget: AliasSourceIdentity | undefined;
 
 	void runFallbackChain({
 		role: aliasModel.id,
@@ -97,10 +107,11 @@ function createFallbackStream(
 				metadataByTarget.delete(targetRef);
 				const target = await resolveAuthenticatedTarget(aliasModel.id, targetRef, registry);
 				mirrorTargetMetadata(aliasModel, aliasModels, target.model);
+				activeTarget = identityOf(target.model);
 				const stream = openTargetStream(
 					kind,
 					target,
-					context,
+					contextForTarget(context, target.model, aliases),
 					withResponseCapture(options, (response) => metadataByTarget.set(targetRef, response)),
 					linkedSignal(options?.signal, attemptSignal),
 				);
@@ -119,7 +130,7 @@ function createFallbackStream(
 			}
 		},
 		forward: (event) => {
-			const forwarded = withAliasIdentity(event, aliasModel);
+			const forwarded = withAliasIdentity(event, aliasModel, activeTarget);
 			lastPartial = partialFrom(forwarded) ?? lastPartial;
 			output.push(forwarded);
 		},
@@ -211,24 +222,100 @@ function linkedSignal(userSignal: AbortSignal | undefined, attemptSignal: AbortS
 	return AbortSignal.any([userSignal, attemptSignal]);
 }
 
-function withAliasIdentity(event: AssistantMessageEvent, aliasModel: Model<Api>): AssistantMessageEvent {
+function withAliasIdentity(
+	event: AssistantMessageEvent,
+	aliasModel: Model<Api>,
+	activeTarget: AliasSourceIdentity | undefined,
+): AssistantMessageEvent {
 	if (event.type === "done") {
-		return { ...event, message: withAliasMessageIdentity(event.message, aliasModel) };
+		return { ...event, message: withAliasMessageIdentity(event.message, aliasModel, activeTarget) };
 	}
 	if (event.type === "error") {
-		return { ...event, error: withAliasMessageIdentity(event.error, aliasModel) };
+		return { ...event, error: withAliasMessageIdentity(event.error, aliasModel, activeTarget) };
 	}
-	return { ...event, partial: withAliasMessageIdentity(event.partial, aliasModel) };
+	return { ...event, partial: withAliasMessageIdentity(event.partial, aliasModel, activeTarget) };
 }
 
-function withAliasMessageIdentity(message: AssistantMessage, aliasModel: Model<Api>): AssistantMessage {
+function withAliasMessageIdentity(
+	message: AssistantMessage,
+	aliasModel: Model<Api>,
+	activeTarget: AliasSourceIdentity | undefined,
+): AliasAssistantMessage {
+	const source = identityOf(message) ?? activeTarget;
 	return {
 		...message,
 		api: aliasModel.api,
 		provider: aliasModel.provider,
 		model: aliasModel.id,
 		responseModel: message.responseModel ?? message.model,
+		...(source ? { aliasSource: source } : {}),
+	} as AliasAssistantMessage;
+}
+
+/**
+ * Build the provider request transcript without mutating the session context.
+ * Thinking is provider-specific state: keep it only when the current target
+ * can replay it under the identity that originally produced it.
+ */
+export function contextForTarget(context: Context, targetModel: Pick<Model<Api>, "provider" | "api" | "id">, aliases: AliasMap): Context {
+	const contextWithMessages = context as Context & { messages: Array<Record<string, any>> };
+	const target: AliasSourceIdentity = {
+		provider: targetModel.provider,
+		api: targetModel.api,
+		model: targetModel.id,
 	};
+	const messages = contextWithMessages.messages.map((message) => {
+		if (message.role !== "assistant") return message;
+
+		const isAliasHistory = message.provider === "alias" && message.api === "alias-delegate";
+		const source: HistorySourceIdentity | undefined = isAliasHistory
+			? explicitAliasSource(message) ?? legacyAliasSource(message, aliases)
+			: identityOf(message);
+		const sameTarget = source !== undefined && source.provider === target.provider && source.model === target.model
+			&& (!isAliasHistory || source.api === undefined || source.api === target.api)
+			&& (isAliasHistory || source.api === target.api);
+
+		if (sameTarget) {
+			if (!isAliasHistory || (message.provider === target.provider && message.api === target.api && message.model === target.model)) {
+				return message;
+			}
+			// pi-ai compares the message identity with the target identity while
+			// transforming history. Restore the original source before replay.
+			return { ...message, provider: target.provider, api: target.api, model: target.model };
+		}
+
+		if (!Array.isArray(message.content) || !message.content.some((block: any) => block?.type === "thinking")) return message;
+		return { ...message, content: message.content.filter((block: any) => block?.type !== "thinking") };
+	});
+	return { ...context, messages } as Context;
+}
+
+function identityOf(value: { provider?: unknown; api?: unknown; model?: unknown; id?: unknown }): AliasSourceIdentity | undefined {
+	const provider = typeof value.provider === "string" ? value.provider : undefined;
+	const api = typeof value.api === "string" ? value.api : undefined;
+	const model = typeof value.model === "string" ? value.model : typeof value.id === "string" ? value.id : undefined;
+	return provider && api && model ? { provider, api, model } : undefined;
+}
+
+function explicitAliasSource(message: Record<string, any>): AliasSourceIdentity | undefined {
+	const source = message.aliasSource;
+	if (!source || typeof source !== "object") return undefined;
+	return identityOf(source);
+}
+
+/** Recover old alias transcripts only when their configured role has one exact model-id match. */
+function legacyAliasSource(message: Record<string, any>, aliases: AliasMap): HistorySourceIdentity | undefined {
+	if (typeof message.model !== "string" || typeof message.responseModel !== "string") return undefined;
+	const configured = aliases.get(message.model);
+	if (!configured) return undefined;
+	const matches = configured.flatMap((targetRef) => {
+		const slash = targetRef.indexOf("/");
+		if (slash < 1 || slash === targetRef.length - 1) return [];
+		const provider = targetRef.slice(0, slash);
+		const model = targetRef.slice(slash + 1);
+		return message.responseModel === model || message.responseModel === targetRef ? [{ provider, model }] : [];
+	});
+	return matches.length === 1 ? matches[0] : undefined;
 }
 
 function partialFrom(event: AssistantMessageEvent): AssistantMessage | undefined {

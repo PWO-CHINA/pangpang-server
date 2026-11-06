@@ -1,4 +1,4 @@
-// One Telegram chat = one long-lived pi AgentSession.
+// One client chat = one long-lived pi AgentSession.
 //
 // Layout (from pi-mom, MIT, Mario Zechner): each chat directory holds
 //   context.jsonl  what the model sees; pi owns it and compacts it
@@ -31,7 +31,8 @@ import { agentPrompt } from "./prompts.ts";
 import { recallBlock } from "./recall.ts";
 import { indexRecord, type LogRecord } from "./search.ts";
 import { createSession } from "./session.ts";
-import { MESSAGE_LIMIT, splitMessage, type Telegram } from "./telegram.ts";
+import { MESSAGE_LIMIT, splitMessage } from "./telegram.ts";
+import type { ChatTransport, ClientChannel, NotificationSink } from "./channels/types.ts";
 
 export interface Inbound {
 	text: string;
@@ -83,25 +84,27 @@ function toolLabel(name: string, args: any): string {
 }
 
 /**
- * A Telegram message that shows progress while the agent works and is
- * replaced by the final answer.  Edits are throttled to stay well inside
- * Telegram's rate limits.
+ * A live progress message for clients that support edits. Edits are throttled
+ * to avoid excessive update traffic.
  */
 class LiveReply {
-	private tg: Telegram;
-	private chatId: string;
+	private transport: ChatTransport;
+	private recipient: string;
+	private supportsEdits: boolean;
 	private messageId: number | undefined;
 	private lines: string[] = [];
 	private dirty = false;
 	private timer: NodeJS.Timeout | undefined;
 	private chain: Promise<void> = Promise.resolve();
 
-	constructor(tg: Telegram, chatId: string) {
-		this.tg = tg;
-		this.chatId = chatId;
+	constructor(transport: ChatTransport, recipient: string, supportsEdits = transport.supportsEdits !== false) {
+		this.transport = transport;
+		this.recipient = recipient;
+		this.supportsEdits = supportsEdits;
 	}
 
 	status(line: string): void {
+		if (!this.supportsEdits) return;
 		this.lines.push(line);
 		if (this.lines.length > 12) this.lines.splice(0, this.lines.length - 12);
 		this.dirty = true;
@@ -114,13 +117,13 @@ class LiveReply {
 		this.dirty = false;
 		const text = `${this.lines.map((l) => `› ${l}`).join("\n")}\n…`;
 		this.enqueue(async () => {
-			if (this.messageId === undefined) this.messageId = await this.tg.send(this.chatId, text, { silent: true });
-			else await this.tg.edit(this.chatId, this.messageId, text);
+			if (this.messageId === undefined) this.messageId = await this.transport.send(this.recipient, text, { silent: true });
+			else await this.transport.edit(this.recipient, this.messageId, text);
 		});
 	}
 
 	private enqueue(fn: () => Promise<void>): void {
-		this.chain = this.chain.then(fn).catch((err) => log.warn("telegram", "reply update failed", errorText(err)));
+		this.chain = this.chain.then(fn).catch((err) => log.warn("conversation", "reply update failed", errorText(err)));
 	}
 
 	/** Replace the progress message with the final text (split if long), or delete it. */
@@ -130,23 +133,33 @@ class LiveReply {
 		this.enqueue(async () => {
 			const id = this.messageId;
 			if (!text) {
-				if (id !== undefined) await this.tg.remove(this.chatId, id);
+				if (id !== undefined) await this.transport.remove(this.recipient, id);
 				return;
 			}
-			const parts = splitMessage(text, MESSAGE_LIMIT);
+			const parts = splitMessage(text, this.transport.messageLimit ?? MESSAGE_LIMIT);
 			// A fresh message notifies the owner; editing the silent progress message would not.
-			if (id !== undefined) await this.tg.remove(this.chatId, id).catch(() => {});
-			for (const part of parts) await this.tg.send(this.chatId, part);
+			if (id !== undefined) await this.transport.remove(this.recipient, id).catch(() => {});
+			for (const part of parts) await this.transport.send(this.recipient, part);
 		});
 		await this.chain;
 	}
 }
 
+export interface ConversationOptions {
+	recipient?: string;
+	notifications?: NotificationSink;
+	channel?: ClientChannel;
+}
+
 export class Conversation {
 	readonly chatId: string;
+	/** Actual client destination; chatId remains the persistent conversation key. */
+	readonly recipient: string;
 	readonly dir: string;
 	readonly scratch: string;
-	private tg: Telegram;
+	private transport: ChatTransport;
+	private notifications: NotificationSink | undefined;
+	private channel: ClientChannel;
 	private review: ReviewHooks;
 	private session!: AgentSession;
 	private snapshot = "";
@@ -154,23 +167,33 @@ export class Conversation {
 	private reply: LiveReply | undefined;
 	/** The last completed assistant message of the current run. */
 	private lastAssistant: any;
+	/** Visible text of every assistant message in the current run, in order. */
+	private turnTexts: string[] = [];
 	private queue: Promise<void> = Promise.resolve();
+	/** Runs counted through delivery, including queued work and final replies. */
+	private runningRuns = 0;
+	private pendingRuns = 0;
+	/** True only while the serialized current prompt belongs to a background event. */
+	private activeEventTurn = false;
 
 	/** Activity since the last background review. */
 	toolCalls = 0;
 	userTurns = 0;
 	reviewedUpTo = 0;
 
-	private constructor(chatId: string, tg: Telegram, review: ReviewHooks) {
+	private constructor(chatId: string, transport: ChatTransport, review: ReviewHooks, options: ConversationOptions) {
 		this.chatId = chatId;
+		this.recipient = options.recipient ?? chatId;
 		this.dir = chatDir(chatId);
 		this.scratch = join(this.dir, "scratch");
-		this.tg = tg;
+		this.transport = transport;
+		this.notifications = options.notifications;
+		this.channel = options.channel ?? transport.channel ?? "telegram";
 		this.review = review;
 	}
 
-	static async open(chatId: string, tg: Telegram, review: ReviewHooks): Promise<Conversation> {
-		const conv = new Conversation(chatId, tg, review);
+	static async open(chatId: string, transport: ChatTransport, review: ReviewHooks, options: ConversationOptions = {}): Promise<Conversation> {
+		const conv = new Conversation(chatId, transport, review, options);
 		mkdirSync(conv.scratch, { recursive: true });
 		mkdirSync(join(conv.dir, "attachments"), { recursive: true });
 		await conv.createSession();
@@ -210,7 +233,8 @@ export class Conversation {
 							this.needsReload = true;
 							this.reviewedUpTo = 0;
 						},
-						attach: (file, caption) => this.tg.sendFile(this.chatId, file, caption),
+						attach: (file, caption) => this.attach(file, caption),
+						notifications: this.notifications,
 						onToolCall: () => {
 							this.toolCalls++;
 						},
@@ -227,7 +251,14 @@ export class Conversation {
 	}
 
 	private onEvent(event: any): void {
-		if (event.type === "message_end" && event.message?.role === "assistant") this.lastAssistant = event.message;
+		if (event.type === "message_end" && event.message?.role === "assistant") {
+			this.lastAssistant = event.message;
+			// A model may write text, call a tool, then write more text.  Keep every
+			// part: using only the last message silently dropped whatever came before
+			// the tool call (owner: "避免再发生这种消息消失的情况").
+			const text = assistantText(event.message);
+			if (text) this.turnTexts.push(text);
+		}
 		const reply = this.reply;
 		if (!reply) return;
 		switch (event.type) {
@@ -246,6 +277,19 @@ export class Conversation {
 		}
 	}
 
+	private async attach(file: string, caption?: string): Promise<void> {
+		if (this.activeEventTurn && this.notifications) {
+			await this.notifications.notify(caption ?? `File from ${this.chatId}`, {
+				via: "pool",
+				file,
+				caption,
+				source: `conversation:${this.chatId}`,
+			});
+			return;
+		}
+		await this.transport.sendFile(this.recipient, file, caption);
+	}
+
 	private appendLog(record: Omit<LogRecord, "chatId">): void {
 		const full: LogRecord = { ...record, chatId: this.chatId };
 		appendFileSync(join(this.dir, "log.jsonl"), `${JSON.stringify(full)}\n`);
@@ -257,7 +301,7 @@ export class Conversation {
 	}
 
 	get busy(): boolean {
-		return this.session.isStreaming;
+		return this.session.isStreaming || this.runningRuns > 0 || this.pendingRuns > 0;
 	}
 
 	/** Handle an owner message or an event.  Calls are serialized per chat. */
@@ -267,15 +311,23 @@ export class Conversation {
 		const prompt = msg.isEvent ? msg.text : `[${localStamp(msg.date)}] ${msg.text}`;
 
 		// While a run is active, steer it instead of waiting behind it.
-		if (this.session.isStreaming && !msg.isEvent) {
+		if (this.session.isStreaming && !msg.isEvent && !this.activeEventTurn) {
 			this.userTurns++;
 			return this.session.prompt(prompt, { streamingBehavior: "steer", images: msg.images }).catch((err) => {
 				log.warn(this.chatId, "steer failed", errorText(err));
 			});
 		}
 
-		this.queue = this.queue.then(() => this.run(msg.isEvent ? prompt : this.withRecall(prompt, msg.text), msg));
-		return this.queue;
+		this.pendingRuns++;
+		const queued = this.queue.catch((err) => {
+			log.warn(this.chatId, "previous queued run failed", errorText(err));
+		}).then(() => this.run(msg.isEvent ? prompt : this.withRecall(prompt, msg.text), msg));
+		this.queue = queued.catch((err) => {
+			log.warn(this.chatId, "queued run failed", errorText(err));
+		});
+		return queued.finally(() => {
+			this.pendingRuns--;
+		});
 	}
 
 	/**
@@ -298,16 +350,32 @@ export class Conversation {
 	}
 
 	private async run(prompt: string, msg: Inbound): Promise<void> {
+		this.runningRuns++;
+		try {
+			await this.runCurrentTurn(prompt, msg);
+		} finally {
+			this.runningRuns--;
+		}
+	}
+
+	private async runCurrentTurn(prompt: string, msg: Inbound): Promise<void> {
 		if (!msg.isEvent) this.userTurns++;
+		this.activeEventTurn = !!msg.isEvent;
 		if (this.needsReload) {
 			this.needsReload = false;
 			await this.session.reload().catch((err) => log.warn(this.chatId, "reload failed", errorText(err)));
 		}
-		const reply = new LiveReply(this.tg, this.chatId);
+		const useNotifications = !!msg.isEvent && !!this.notifications;
+		const reply = useNotifications
+			? undefined
+			: new LiveReply(this.transport, this.recipient, this.transport.supportsEdits ?? this.channel !== "weixin");
 		this.reply = reply;
-		const typing = setInterval(() => void this.tg.typing(this.chatId), 4500);
-		void this.tg.typing(this.chatId);
+		const typing = useNotifications
+			? undefined
+			: setInterval(() => void this.transport.typing(this.recipient).catch(() => {}), 4500);
+		if (!useNotifications) void this.transport.typing(this.recipient).catch(() => {});
 		this.lastAssistant = undefined;
+		this.turnTexts = [];
 		let failure: string | undefined;
 		try {
 			await this.session.prompt(prompt, { images: msg.images, expandPromptTemplates: false });
@@ -315,12 +383,12 @@ export class Conversation {
 			failure = errorText(err);
 			log.error(this.chatId, "run failed", err);
 		} finally {
-			clearInterval(typing);
+			if (typing) clearInterval(typing);
 		}
 
 		// Some models occasionally end a turn with only thinking, no visible
 		// text.  Ask once for the answer rather than sending "(no reply)".
-		if (!failure && this.lastAssistant?.stopReason === "stop" && !assistantText(this.lastAssistant)) {
+		if (!failure && this.lastAssistant?.stopReason === "stop" && !(useNotifications ? this.finalNotificationText() : this.visibleText())) {
 			log.info(this.chatId, "empty reply; asking for the final answer");
 			try {
 				await this.session.prompt(
@@ -334,25 +402,32 @@ export class Conversation {
 			}
 		}
 		this.reply = undefined;
+		this.activeEventTurn = false;
 
 		// Taken from this run's events, not from session.messages: compaction
 		// during the run shrinks the message list.
 		const last = this.lastAssistant;
-		let text = assistantText(last);
+		// Tool-call commentary is retained for owner conversations, but it is not
+		// a completed notification. In particular, it must not defeat [SILENT]
+		// or hide an empty final response that needs the follow-up above.
+		let text = useNotifications ? this.finalNotificationText() : this.visibleText();
 		if (!failure && last?.stopReason === "error") failure = last.errorMessage ?? "model error";
-		if (!failure && last?.stopReason === "aborted") text = text || "(stopped)";
+		if (!failure && last?.stopReason === "aborted") text = useNotifications ? "(stopped)" : text || "(stopped)";
 
 		if (failure) {
-			await reply.finish(`⚠️ ${failure}`);
+			const text = `⚠️ ${failure}`;
+			if (useNotifications) await this.notifications!.notify(text, { via: "pool", source: `conversation:${this.chatId}` });
+			else await reply!.finish(text);
 			return;
 		}
 		if (text.startsWith("[SILENT]")) {
 			log.info(this.chatId, "silent reply");
-			await reply.finish(undefined);
+			await reply?.finish(undefined);
 			return;
 		}
 		this.appendLog({ date: new Date().toISOString(), role: "assistant", name: "pangpang", text });
-		await reply.finish(text || "(no reply)");
+		if (useNotifications) await this.notifications!.notify(text || "(no reply)", { via: "pool", source: `conversation:${this.chatId}` });
+		else await reply!.finish(text || "(no reply)");
 		void commitGrowth(`learn from chat ${this.chatId}`);
 		this.review.schedule(this);
 	}
@@ -363,11 +438,21 @@ export class Conversation {
 		return true;
 	}
 
+	/** Everything the model said to the owner this run, in order. */
+	private visibleText(): string {
+		return (this.turnTexts.length ? this.turnTexts.join("\n") : assistantText(this.lastAssistant)).trim();
+	}
+
+	/** Only an assistant response that completed normally is a final notification. */
+	private finalNotificationText(): string {
+		return this.lastAssistant?.stopReason === "stop" ? assistantText(this.lastAssistant) : "";
+	}
+
 	/** Start a fresh context.  The old context file is kept next to the log. */
 	async reset(): Promise<void> {
 		await this.abort();
 		this.review.cancel(this);
-		this.session.dispose();
+		await this.closeSession(this.session);
 		const file = join(this.dir, "context.jsonl");
 		if (existsSync(file)) {
 			renameSync(file, join(this.dir, `context-${new Date().toISOString().replaceAll(":", "-")}.jsonl`));
@@ -376,6 +461,15 @@ export class Conversation {
 		this.userTurns = 0;
 		this.reviewedUpTo = 0;
 		await this.createSession();
+	}
+
+	private async closeSession(session: AgentSession): Promise<void> {
+		try {
+			await session.extensionRunner?.emit({ type: "session_shutdown", reason: "quit" });
+		} catch (err) {
+			log.warn(this.chatId, "session shutdown hook failed", errorText(err));
+		}
+		session.dispose();
 	}
 
 	async compact(instructions?: string): Promise<string> {
@@ -489,14 +583,14 @@ export class Conversation {
 	async saveAttachment(fileId: string, fileName: string): Promise<{ path: string; image?: Inbound["images"] }> {
 		const safe = basename(fileName).replace(/[^\w.\-一-鿿]/g, "_") || "file";
 		const path = join(this.dir, "attachments", `${Date.now()}-${safe}`);
-		await this.tg.download(fileId, path);
+		await this.transport.download(fileId, path);
 		const mime = IMAGE_TYPES[extname(path).toLowerCase()];
 		if (!mime) return { path };
 		return { path, image: [{ type: "image", mimeType: mime, data: readFileSync(path).toString("base64") }] };
 	}
 
-	dispose(): void {
+	async dispose(): Promise<void> {
 		this.review.cancel(this);
-		this.session.dispose();
+		await this.closeSession(this.session);
 	}
 }
